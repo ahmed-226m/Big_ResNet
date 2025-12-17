@@ -1,6 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+import json
+import argparse
+import nibabel as nib
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 
 # -----------------------------
 # SupCon Loss (directly from SupContrast repo - unchanged)
@@ -271,3 +277,125 @@ def create_classifier(pretrained_path=None, device='cpu', in_channels=1, num_cla
 
 # Alias for compatibility if user import expects SupCEResNet3D
 SupCEResNet3D = VertebraClassifier
+
+# -----------------------------
+# Dataset and Execution
+# -----------------------------
+class VertebraDataset(Dataset):
+    """
+    Dataset for 3D Vertebrae.
+    Expected structure:
+    root_dir/
+      CT/
+        filename.nii.gz (or .nii)
+    """
+    def __init__(self, root_dir, json_path, transform=None):
+        self.root_dir = root_dir
+        self.ct_dir = os.path.join(root_dir, 'CT')
+        self.transform = transform
+        
+        # Load labels
+        with open(json_path, 'r') as f:
+            self.json_data = json.load(f)
+        
+        # Flatten json data (it might be nested like {'train': {...}, 'test': {...}} or flat)
+        self.labels_map = {}
+        for k, v in self.json_data.items():
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    self.labels_map[sub_k] = sub_v
+            else:
+                self.labels_map[k] = v
+                
+        # List valid files
+        self.samples = []
+        if os.path.exists(self.ct_dir):
+            files = sorted([f for f in os.listdir(self.ct_dir) if f.endswith('.nii') or f.endswith('.nii.gz')])
+            for f in files:
+                # filename like 'sub-verse004_16.nii.gz' -> id 'sub-verse004_16'
+                # Handle simplified naming
+                base = f.replace('.nii.gz', '').replace('.nii', '')
+                
+                # Check if we have a label
+                # Some filenames might have extra suffixes, try exact match first
+                label = -1
+                if base in self.labels_map:
+                    label = self.labels_map[base]
+                else:
+                    # Try removing _seriesX or other heuristics if needed, or simple skip
+                    # For now, strict match or print warning in debug
+                    pass
+                
+                if label != -1:
+                    # Binarize label: 0->0 (Healthy), 1,2,3->1 (Fracture)
+                    # Modify this if multi-class is needed
+                    binary_label = 0 if label == 0 else 1
+                    self.samples.append((os.path.join(self.ct_dir, f), binary_label, base))
+        else:
+            print(f"Warning: CT directory not found at {self.ct_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label, case_id = self.samples[idx]
+        
+        # Load NIfTI
+        try:
+            img = nib.load(path)
+            data = img.get_fdata().astype(np.float32)
+            
+            # Normalize [0,1]
+            grad_min, grad_max = data.min(), data.max()
+            if grad_max - grad_min > 0:
+                data = (data - grad_min) / (grad_max - grad_min)
+            
+            # Transform to tensor (C, D, H, W)
+            # Input data is likely (H, W, D) based on previous context, needs permute
+            # straighten_mask_3d output is (128, 128, 64) or (256, 256, 64)
+            data_tensor = torch.from_numpy(data)
+            
+            # Ensure dims are (C, D, H, W) for 3D Conv
+            # If shape is (H, W, D), permute to (D, H, W) then unsqueeze C
+            if data_tensor.ndim == 3:
+                data_tensor = data_tensor.permute(2, 0, 1).unsqueeze(0) # -> (1, D, H, W)
+            
+            return data_tensor, label, case_id
+            
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            return torch.zeros((1, 64, 256, 256)), label, case_id
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Vertebra Classifier & SupCon Model')
+    parser.add_argument('--input-path', type=str, required=True, help='Path to dataset root (containing CT folder)')
+    parser.add_argument('--json-path', type=str, required=True, help='Path to vertebra_data.json')
+    parser.add_argument('--pretrained-path', type=str, default=None, help='Path to .pth checkpoint')
+    parser.add_argument('--batch-size', type=int, default=1, help='Batch size for testing')
+    parser.add_argument('--num-classes', type=int, default=2, help='Number of classes')
+    
+    args = parser.parse_args()
+    
+    print(f"Initializing model with {args.num_classes} classes...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = create_classifier(pretrained_path=args.pretrained_path, device=device, num_classes=args.num_classes)
+    
+    print(f"Loading data from {args.input_path}...")
+    dataset = VertebraDataset(args.input_path, args.json_path)
+    print(f"Found {len(dataset)} labeled samples.")
+    
+    if len(dataset) > 0:
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+        
+        # Run a quick check on first batch
+        data, label, ids = next(iter(loader))
+        data = data.to(device)
+        print(f"Sample input shape: {data.shape}")
+        
+        output = model(data)
+        print(f"Model output shape: {output.shape}")
+        print(f"Sample predictions: {torch.argmax(output, dim=1).cpu().numpy()}")
+        print(f"Sample ground truth: {label.numpy()}")
+        print("Model is ready-to-run on input data.")
+    else:
+        print("No samples found. Check paths.")
