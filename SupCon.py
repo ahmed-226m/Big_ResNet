@@ -7,6 +7,7 @@ import argparse
 import nibabel as nib
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+import torchvision.models.video as video_models
 
 # -----------------------------
 # SupCon Loss (directly from SupContrast repo - unchanged)
@@ -246,33 +247,92 @@ class VertebraClassifier(nn.Module):
         # If we register a forward hook on the block, output will be correct.
         return self.encoder.layer4[-1]
 
-def create_classifier(pretrained_path=None, device='cpu', in_channels=1, num_classes=2):
-    """Factory function to create and load classifier."""
-    model = VertebraClassifier(in_channels=in_channels, num_classes=num_classes)
-    model.to(device)
-    
-    if pretrained_path:
-        if isinstance(pretrained_path, str) and os.path.exists(pretrained_path):
-            state_dict = torch.load(pretrained_path, map_location=device)
-            # Handle potential DataParallel wrapping or SupCon prefix
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                name = k
-                if name.startswith('module.'):
-                    name = name[7:]
-                if name.startswith('encoder.'): # If loading from SupCon-style but we are same class
-                     pass # Matches our structure
-                new_state_dict[name] = v
-            
-            # If strict=False, we can load what matches.
-            try:
-                model.load_state_dict(new_state_dict, strict=True)
-            except RuntimeError as e:
-                print(f"Warning: strict loading failed, trying strict=False. Error: {e}")
-                model.load_state_dict(new_state_dict, strict=False)
+class PretrainedVertebraClassifier(nn.Module):
+    """
+    Wrapper for torchvision's R3D models (Kinetics-400 pretrained).
+    Modifies first layer for 1-channel input.
+    """
+    def __init__(self, model_name='r3d_18', in_channels=1, num_classes=2, pretrained=True):
+        super(PretrainedVertebraClassifier, self).__init__()
+        
+        # Load torchvision model
+        weights = 'KINETICS400_V1' if pretrained else None
+        if model_name == 'r3d_18':
+            self.model = video_models.r3d_18(weights=weights)
+            # r3d_18 has 'layer4'
+            self.gradcam_layer_attr = 'layer4'
+        elif model_name == 'mc3_18':
+            self.model = video_models.mc3_18(weights=weights)
+            self.gradcam_layer_attr = 'layer4'
+        elif model_name == 'r3d_50': # Much heavier
+            # r3d_50 weights might not be standard in older torchvision, check version if error
+            self.model = video_models.r3d_18(weights=weights) # Fallback to 18 if 50 unspecified
+            self.gradcam_layer_attr = 'layer4'
         else:
-             print(f"Pretrained path {pretrained_path} not found or invalid.")
+             raise ValueError(f"Unknown model {model_name}")
+
+        # Modify first layer (stem) to accept in_channels (CT is 1 channel)
+        # Original: Conv3d(3, 64, kernel_size=(3, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3), bias=False)
+        old_conv = self.model.stem[0]
+        if old_conv.in_channels != in_channels:
+             new_conv = nn.Conv3d(
+                 in_channels, 
+                 old_conv.out_channels, 
+                 kernel_size=old_conv.kernel_size, 
+                 stride=old_conv.stride, 
+                 padding=old_conv.padding, 
+                 bias=old_conv.bias is not None
+             )
+             
+             # Initialize with average of RGB weights if pretrained
+             if pretrained:
+                 with torch.no_grad():
+                     new_conv.weight[:] = old_conv.weight.mean(dim=1, keepdim=True)
+             
+             self.model.stem[0] = new_conv
+        
+        # Replace final fc layer
+        # Linear(in_features=512, out_features=400, bias=True)
+        in_features = self.model.fc.in_features
+        self.model.fc = nn.Linear(in_features, num_classes)
+        
+    def forward(self, x):
+        return self.model(x)
+
+    def get_gradcam_target_layer(self):
+        # Return the last block of the last residual layer
+        layer = getattr(self.model, self.gradcam_layer_attr)
+        return layer[-1]
+
+def create_classifier(pretrained_path=None, device='cpu', in_channels=1, num_classes=2):
+    """Factory function to create classifier."""
     
+    # Check if we should use torchvision pretrained
+    if pretrained_path and 'kinetics' in str(pretrained_path).lower():
+        print(f"Loading Torchvision model with {pretrained_path} weights...")
+        model = PretrainedVertebraClassifier(model_name='r3d_18', in_channels=in_channels, num_classes=num_classes, pretrained=True)
+    else:
+        # Use custom ResNet3D (scratch or custom checkpoint)
+        model = VertebraClassifier(in_channels=in_channels, num_classes=num_classes)
+    
+        if pretrained_path:
+            if isinstance(pretrained_path, str) and os.path.exists(pretrained_path):
+                state_dict = torch.load(pretrained_path, map_location=device)
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    name = k
+                    if name.startswith('module.'): name = name[7:]
+                    if name.startswith('encoder.'): pass
+                    new_state_dict[name] = v
+                try:
+                    model.load_state_dict(new_state_dict, strict=True)
+                except:
+                    model.load_state_dict(new_state_dict, strict=False)
+                print(f"Loaded weights from file {pretrained_path}")
+            else:
+                 print(f"Pretrained path {pretrained_path} not found or invalid.")
+    
+    model.to(device)
     return model
 
 # Alias for compatibility if user import expects SupCEResNet3D
