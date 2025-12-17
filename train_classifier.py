@@ -44,6 +44,11 @@ def train(args):
     print(f"Initializing model (Pretrained: {args.pretrained_path})")
     model = create_classifier(pretrained_path=args.pretrained_path, device=device, num_classes=args.num_classes)
     
+    # Multi-GPU Support
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+    
     # 4. Optimizer & Loss
     # We use a lower LR for the pretrained encoder and higher for the new head (optional, but good for transfer learning)
     # For simplicity, standard Adam is fine for now. weight_decay helps regularization.
@@ -54,12 +59,13 @@ def train(args):
     criterion = nn.CrossEntropyLoss()
 
     # Learning Rate Scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
     # 5. Training Loop
     best_f1 = 0.0
     start_time = time.time()
     
+    print("Starting training loop...")
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
@@ -79,6 +85,9 @@ def train(args):
             _, preds = torch.max(output, 1)
             train_preds.extend(preds.cpu().numpy())
             train_targets.extend(target.cpu().numpy())
+            
+            if batch_idx % 10 == 0:
+                print(f"Epoch {epoch+1} | Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f}")
 
         # Calculate Train Metrics
         train_acc = accuracy_score(train_targets, train_preds)
@@ -91,10 +100,8 @@ def train(args):
         val_preds = []
         val_targets = []
         
+        print("Running validation...")
         with torch.no_grad():
-            for data, target, _ in enumerate(val_loader): # Fixed loop
-                # Correct loop unpacking
-                pass
             for data, target, _ in val_loader:
                 data, target = data.to(device), target.to(device)
                 output = model(data)
@@ -112,10 +119,10 @@ def train(args):
         val_recall = recall_score(val_targets, val_preds, average='binary', zero_division=0)
         avg_val_loss = val_loss / len(val_loader)
         
-        scheduler.step(avg_val_loss)
+        scheduler.step(avg_val_loss) # verbose removed
 
         # Logging
-        print(f"Epoch {epoch+1}/{args.epochs}")
+        print(f"Epoch {epoch+1}/{args.epochs} Summary:")
         print(f"  Train Loss: {avg_train_loss:.4f} | Acc: {train_acc:.4f} | F1: {train_f1:.4f}")
         print(f"  Val   Loss: {avg_val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f} | Prec: {val_precision:.4f} | Rec: {val_recall:.4f}")
         
@@ -123,7 +130,13 @@ def train(args):
         if val_f1 > best_f1:
             best_f1 = val_f1
             save_path = os.path.join(args.output_dir, "best_model.pth")
-            torch.save(model.state_dict(), save_path)
+            
+            # Save clean state_dict (unwrap DataParallel)
+            if isinstance(model, nn.DataParallel):
+                torch.save(model.module.state_dict(), save_path)
+            else:
+                torch.save(model.state_dict(), save_path)
+                
             print(f"  -> Model saved to {save_path}")
 
     total_time = time.time() - start_time

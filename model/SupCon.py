@@ -440,6 +440,10 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = create_classifier(pretrained_path=args.pretrained_path, device=device, num_classes=args.num_classes)
     
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+
     print(f"Loading data from {args.input_path}...")
     dataset = VertebraDataset(args.input_path, args.json_path)
     print(f"Found {len(dataset)} labeled samples.")
