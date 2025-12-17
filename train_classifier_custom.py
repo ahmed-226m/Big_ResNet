@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, random_split, Dataset
 import json
 import nibabel as nib
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+# Import the OLD classifier
 try:
     from model.fracture_classifier import VertebraClassifier
 except ImportError:
@@ -17,7 +19,6 @@ except ImportError:
     import sys
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from model.fracture_classifier import VertebraClassifier
-
 # We need to redefine Dataset because it's not in fracture_classifier.py
 class VertebraDataset(Dataset):
     def __init__(self, root_dir, json_path, transform=None):
@@ -64,7 +65,6 @@ class VertebraDataset(Dataset):
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
     dataset = VertebraDataset(args.input_path, args.json_path)
     val_size = int(0.2 * len(dataset))
@@ -75,7 +75,6 @@ def train(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
     # Initialize Custom Model (Random Weights)
-    print("Initializing Custom VertebraClassifier...")
     model = VertebraClassifier(in_channels=1, num_classes=args.num_classes, use_se=True)
     
     if torch.cuda.device_count() > 1:
@@ -86,7 +85,6 @@ def train(args):
     criterion = nn.CrossEntropyLoss()
     best_f1 = 0.0
 
-    print("Starting training...")
     for epoch in range(args.epochs):
         model.train()
         train_preds, train_targets = [], []
@@ -102,28 +100,37 @@ def train(args):
             _, preds = torch.max(output, 1)
             train_preds.extend(preds.cpu().numpy())
             train_targets.extend(target.cpu().numpy())
-            
-            if i % 10 == 0:
-                 print(f"Epoch {epoch+1} | Batch {i} | Loss: {loss.item():.4f}")
 
         # Metrics
+        train_acc = accuracy_score(train_targets, train_preds)
         train_f1 = f1_score(train_targets, train_preds, average='binary')
+        train_precision = precision_score(train_targets, train_preds, average='binary', zero_division=0)
+        train_recall = recall_score(train_targets, train_preds, average='binary', zero_division=0)
         
         # Validation
         model.eval()
+        val_loss = 0.0
         val_preds, val_targets = [], []
         with torch.no_grad():
             for data, target, _ in val_loader:
                 data, target = data.to(device), target.to(device)
                 output = model(data)
+                loss = criterion(output, target)
+                val_loss += loss.item()
                 _, preds = torch.max(output, 1)
                 val_preds.extend(preds.cpu().numpy())
                 val_targets.extend(target.cpu().numpy())
         
         val_f1 = f1_score(val_targets, val_preds, average='binary')
         val_acc = accuracy_score(val_targets, val_preds)
+        val_precision = precision_score(val_targets, val_preds, average='binary', zero_division=0)
+        val_recall = recall_score(val_targets, val_preds, average='binary', zero_division=0)
         
-        print(f"Epoch {epoch+1} Summary: Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | Val Acc: {val_acc:.4f}")
+        print("-" * 50)
+        print(f"Epoch {epoch+1}/{args.epochs} Report:")
+        print(f"Train | Acc: {train_acc:.4f} | F1: {train_f1:.4f} | Prec: {train_precision:.4f} | Rec: {train_recall:.4f}")
+        print(f"Val   | Acc: {val_acc:.4f} | F1: {val_f1:.4f} | Prec: {val_precision:.4f} | Rec: {val_recall:.4f} | Loss: {val_loss/len(val_loader):.4f}")
+        print("-" * 50)
 
         if val_f1 > best_f1:
             best_f1 = val_f1
